@@ -140,7 +140,32 @@ getparentenv <- function(pkgname) {
                  "job",
                  time)
 
-  addJob(id, config = data$config, packages = obj$packages)
+  if(!is.null(obj$options$azure$job)){
+    id <- obj$options$azure$job
+  }
+
+  retryCounter <- 0
+  maxRetryCount <- 5
+  while(retryCounter < maxRetryCount){
+    sprintf("job id is: %s", id)
+    # try to submit the job. We may run into naming conflicts. If so, try again
+    tryCatch({
+      retryCounter <- retryCounter + 1
+      addJob(id, config = data$config, packages = obj$packages)
+      break;
+    },
+    error=function(e) {
+      if (retryCounter == maxRetryCount) {
+        stop(sprintf('Error creating job: %s\n',
+                    conditionMessage(e)))
+      }
+
+      time <- format(Sys.time(), "%Y%m%d%H%M%S", tz = "GMT")
+      id <-  sprintf("%s%s",
+                     "job",
+                     time)
+    })
+  }
 
   print("Job Summary: ")
   job <- getJob(id)
