@@ -1,0 +1,216 @@
+generatePoolConfig <- function(fileName, ...){
+  args <- list(...)
+
+  batchAccount <- ifelse(is.null(args$batchAccount), "batch_account_name", args$batchAccount)
+  batchKey <- ifelse(is.null(args$batchKey), "batch_account_key", args$batchKey)
+  batchUrl <- ifelse(is.null(args$batchUrl), "batch_account_url", args$batchUrl)
+
+  storageName <- ifelse(is.null(args$storageName), "storage_account_name", args$storageName)
+  storageKey <- ifelse(is.null(args$storageKey), "storage_account_key", args$storageKey)
+
+  packages <- ifelse(is.null(args$packages), list(), args$packages)
+
+  if(!file.exists(paste0(getwd(), "/", fileName))){
+    config <- list(
+      batchAccount = list(
+        name = batchAccount,
+        key = batchKey,
+        url = batchUrl,
+        pool = list(
+          name = "myPoolName",
+          vmSize = "Standard_F2",
+          maxTasksPerNode = 1,
+          poolSize = list(
+            minNodes = 3,
+            maxNodes = 10,
+            autoscaleFormula = "QUEUE"
+          )
+        ),
+        rPackages = list(
+          cran = list(
+            source = "http://cran.us.r-project.org",
+            name = c(
+              "devtools",
+              "httr"
+            )
+          ),
+          github = c(
+            "twitter/AnomalyDetection",
+            "hadley/httr"
+          )
+        )
+      ),
+      storageAccount = list(
+        name = storageName,
+        key = storageKey
+      ),
+      settings = list(
+        verbose = FALSE
+      )
+    )
+
+    configJson <- jsonlite::toJSON(config, auto_unbox = TRUE, pretty = TRUE)
+    write(configJson, file=paste0(getwd(), "/", fileName))
+
+    print(sprintf("A config file has been generated %s. Please enter your Batch credentials.", paste0(getwd(), "/", fileName)))
+  }
+}
+
+makeCluster <- function(fileName = "az_config.json", fullName = FALSE, waitForPool = TRUE){
+  setPoolOption(fileName, fullName)
+  config <- getOption("az_config")
+  pool <- config$batchAccount$pool
+
+  response <- addPool(
+    pool$name,
+    pool$vmSize,
+    autoscaleFormula = .getFormula(pool$poolSize$autoscaleFormula, pool$poolSize$minNodes, pool$poolSize$maxNodes),
+    maxTasksPerNode = pool$maxTasksPerNode,
+    raw = TRUE,
+    packages = config$batchAccount$rPackages$github)
+
+  pool <- getPool(pool$name)
+
+  if(grepl("AuthenticationFailed", response)){
+    stop("Check your credentials and try again.");
+  }
+
+  if(grepl("PoolExists", response)){
+    print("The specified pool already exists. Will use existing pool.")
+  }
+  else{
+    if(waitForPool){
+      waitForClusterCreation(pool$id, 60000, targetDedicated = pool$targetDedicated)
+    }
+  }
+
+  print("Your pool has been registered.")
+  print(sprintf("Node Count: %i", pool$targetDedicated))
+  return(getOption("az_config"))
+}
+
+stopCluster <- function(pool){
+  deletePool(pool$batchAccount$pool$name)
+}
+
+setPoolOption <- function(fileName = "az_config.json", fullName = FALSE){
+  if(fullName){
+    config <- rjson::fromJSON(file=paste0(fileName))
+  }
+  else{
+    config <- rjson::fromJSON(file=paste0(getwd(), "/", fileName))
+  }
+
+  options("az_config" = config)
+}
+
+getPoolWorkers <- function(poolId, ...){
+  args <- list(...)
+  raw <- !is.null(args$RAW)
+
+  batchCredentials <- getBatchCredentials()
+
+  nodes <- listPoolNodes(poolId)
+
+  if(length(nodes$value) > 0){
+    for(i in 1:length(nodes$value)){
+      print(sprintf("Node: %s - %s - %s", nodes$value[[i]]$id, nodes$value[[i]]$state, nodes$value[[i]]$ipAddress))
+    }
+  }
+  else{
+    print("There are currently no nodes in the pool.")
+  }
+
+  if(raw){
+    return(nodes)
+  }
+}
+
+waitForClusterCreation <- function(poolId, timeout, ...){
+  print("Booting compute nodes. . . ")
+
+  args <- list(...)
+
+  if(!args$targetDedicated){
+    stop("Pool's current target dedicated not calculated. Please try again.")
+  }
+
+  numOfNodes <- args$targetDedicated
+
+  pb <- txtProgressBar(min = 0, max = numOfNodes, style = 3)
+  prevCount <- 0
+  timeToTimeout <- Sys.time() + timeout
+
+  while(Sys.time() < timeToTimeout){
+    nodes <- listPoolNodes(poolId)
+
+    startTaskFailed <- TRUE
+
+    if(!is.null(nodes$value) && length(nodes$value) > 0){
+      nodeStates <- lapply(nodes$value, function(x){
+        if(x$state == "idle"){
+          return(1)
+        }
+        else if(x$state == "creating"){
+          return(0.25)
+        }
+        else if(x$state == "starting"){
+          return(0.50)
+        }
+        else if(x$state == "waitingforstarttask"){
+          return(0.75)
+        }
+        else if(x$state == "starttaskfailed"){
+          startTaskFailed <- FALSE
+          return(0)
+        }
+        else{
+          return(0)
+        }
+      })
+
+      count <- sum(unlist(nodeStates))
+
+      if(count > prevCount){
+        setTxtProgressBar(pb, count)
+        prevCount <- count
+      }
+
+      stopifnot(startTaskFailed)
+
+      if(count == numOfNodes){
+        return(0);
+      }
+    }
+
+    setTxtProgressBar(pb, prevCount)
+    Sys.sleep(30)
+  }
+
+  stop("Timeout expired")
+}
+
+.addTask1 <- function(jobId, taskId){
+  rCommand <- sprintf("Rscript --vanilla --verbose $AZ_BATCH_JOB_PREP_WORKING_DIR/%s %s %s > %s.txt", "worker.R", "$AZ_BATCH_TASK_WORKING_DIR", envFile, taskId)
+  autoUploadCommand <- sprintf("env PATH=$PATH blobxfer %s %s %s --upload --saskey $BLOBXFER_SASKEY --remoteresource result/%s", storageCredentials$name, jobId, resultFile, resultFile)
+  stdoutUploadCommand <- sprintf("env PATH=$PATH blobxfer %s %s $AZ_BATCH_TASK_DIR/%s --upload --saskey $BLOBXFER_SASKEY --remoteresource %s", storageCredentials$name, jobId, "stdout.txt", paste0("stdout/", taskId, "-stdout.txt"))
+  stderrUploadCommand <- sprintf("env PATH=$PATH blobxfer %s %s $AZ_BATCH_TASK_DIR/%s --upload --saskey $BLOBXFER_SASKEY --remoteresource %s", storageCredentials$name, jobId, "stderr.txt", paste0("stderr/", taskId, "-stderr.txt"))
+  logsCommand <- sprintf("env PATH=$PATH blobxfer %s %s %s --upload --saskey $BLOBXFER_SASKEY --remoteresource logs/%s", storageCredentials$name, jobId, paste0(taskId, ".txt"), paste0(taskId, ".txt"))
+  commands <- c("export PATH=/anaconda/envs/py35/bin:$PATH", rCommand, autoUploadCommand, stdoutUploadCommand, stderrUploadCommand, logCommand)
+
+  resourceFiles <- c()
+
+  settings = list(name = "BLOBXFER_SASKEY",
+                 value = sasQuery)
+  addTask(jobId,
+          taskId
+          );
+}
+
+.addTaskMerge <- function(){
+  autoUploadCommand <- sprintf("env PATH=$PATH blobxfer %s %s %s --upload --saskey $BLOBXFER_SASKEY --remoteresource result/%s", storageCredentials$name, jobId, resultFile, resultFile)
+  downloadCommand <- sprintf("env PATH=$PATH blobxfer %s %s %s --download --saskey $BLOBXFER_SASKEY --remoteresource . --include result/*.rds", storageCredentials$name, jobId, "$AZ_BATCH_TASK_WORKING_DIR")
+
+  commands <- c("export PATH=/anaconda/envs/py35/bin:$PATH", downloadCommand, rCommand, autoUploadCommand)
+  resourceFiles <- c()
+}
